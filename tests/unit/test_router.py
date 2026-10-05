@@ -17,6 +17,7 @@ import asyncio
 import base64
 import inspect
 import io
+import json
 import threading
 from types import SimpleNamespace
 
@@ -33,6 +34,8 @@ from molt.trainer.rollout.router import (
 
 GEN = "/inference/v1/generate"
 RENDER = "/v1/chat/completions/render"
+_JSON_DUMPS = json.dumps
+_JSON_LOADS = json.loads
 
 
 class _FakeResp:
@@ -42,8 +45,8 @@ class _FakeResp:
     def raise_for_status(self):
         pass
 
-    async def json(self):
-        return self._p
+    async def read(self):
+        return _JSON_DUMPS(self._p).encode()
 
 
 class _FakeCtx:
@@ -64,8 +67,9 @@ class _FakeHttp:
         self.by_url = by_url
         self.calls = []
 
-    def post(self, url, json=None, headers=None):
-        self.calls.append((url, json, headers))
+    def post(self, url, json=None, data=None, headers=None):
+        payload = json if json is not None else _JSON_LOADS(data)
+        self.calls.append((url, payload, headers))
         return _FakeCtx(self.by_url[url])
 
 
@@ -76,8 +80,8 @@ class _RaisingResp:
     def raise_for_status(self):
         raise self._exc
 
-    async def json(self):
-        return {}
+    async def read(self):
+        return b"{}"
 
 
 class _RaisingCtx:
@@ -98,7 +102,7 @@ class _FlakyHttp:
         self.payload, self.exc, self.fail_times = payload, exc, fail_times
         self.attempts = 0
 
-    def post(self, url, json=None, headers=None):
+    def post(self, url, json=None, data=None, headers=None):
         self.attempts += 1
         return _RaisingCtx(self.exc) if self.attempts <= self.fail_times else _FakeCtx(self.payload)
 
@@ -188,6 +192,31 @@ def test_post_fails_fast_on_4xx(monkeypatch):
     with pytest.raises(aiohttp.ClientResponseError):
         asyncio.run(RouterGenerateClient(http).generate([1, 2], _sp()))
     assert http.attempts == 1
+
+
+def test_post_runs_json_conversions_outside_event_loop_thread(monkeypatch):
+    conversion_threads = {}
+
+    def _recording_dumps(payload):
+        conversion_threads["dumps"] = threading.get_ident()
+        return _JSON_DUMPS(payload)
+
+    def _recording_loads(payload):
+        conversion_threads["loads"] = threading.get_ident()
+        return _JSON_LOADS(payload)
+
+    monkeypatch.setattr("molt.trainer.rollout.router.json.dumps", _recording_dumps)
+    monkeypatch.setattr("molt.trainer.rollout.router.json.loads", _recording_loads)
+    client = RouterGenerateClient(_FakeHttp({GEN: _gen_resp([90])}))
+
+    async def _run():
+        event_loop_thread = threading.get_ident()
+        await client.generate([1], _sp())
+        return event_loop_thread
+
+    event_loop_thread = asyncio.run(_run())
+    assert conversion_threads.keys() == {"dumps", "loads"}
+    assert all(thread != event_loop_thread for thread in conversion_threads.values())
 
 
 def test_align_features_to_canonical_uses_image_token_run():

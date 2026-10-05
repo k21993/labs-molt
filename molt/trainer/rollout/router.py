@@ -30,6 +30,7 @@ trainer round-robins prompts across a list of them (``--rollout.num_runners``).
 import asyncio
 import base64
 import io
+import json
 import socket
 import time
 from copy import deepcopy
@@ -236,13 +237,15 @@ class RouterGenerateClient:
         checks) or is briefly overloaded — so a hiccup costs a retry, not a dropped rollout (vime/slime
         retry the same way). A 4xx is a real client bug, so it fails fast rather than burn the retry
         budget. The session sets no read timeout, so a slow generation never lands here at all."""
-        headers = {"x-session-id": session_id} if session_id else None
-        body = {"model": self.model_name, **payload}
+        headers = {"Content-Type": "application/json"}
+        if session_id:
+            headers["x-session-id"] = session_id
+        body = await asyncio.to_thread(json.dumps, {"model": self.model_name, **payload})
         for attempt in range(retries):
             try:
-                async with self.http.post(path, json=body, headers=headers) as resp:
+                async with self.http.post(path, data=body, headers=headers) as resp:
                     resp.raise_for_status()
-                    return await resp.json()
+                    return await asyncio.to_thread(json.loads, await resp.read())
             except (aiohttp.ClientResponseError, aiohttp.ClientConnectionError) as e:
                 fatal = isinstance(e, aiohttp.ClientResponseError) and e.status < 500  # 4xx = real bug
                 if fatal or attempt == retries - 1:
