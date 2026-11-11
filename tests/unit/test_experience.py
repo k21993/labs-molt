@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -157,13 +155,16 @@ def test_experience_offload_reload_roundtrip(monkeypatch):
         sequences=torch.arange(6).view(1, 6),
         attention_mask=torch.ones(1, 6, dtype=torch.long),
         action_mask=torch.ones(1, 5, dtype=torch.bool),
+        rollout_log_probs=torch.zeros(1, 5),
         rewards=torch.tensor([1.0]),
         mm_train_inputs=[{"pixel_values": torch.zeros(2, 3)}],
     )
     exp.offload()
     assert exp.heavy_ref is not None
     assert exp.sequences is None and exp.attention_mask is None and exp.mm_train_inputs is None
-    assert exp.action_mask is not None and exp.rewards is not None  # light fields untouched
+    # Light fields untouched, rollout_log_probs among them: the controller reads the KL reference
+    # off it (--algo.kl.ref rollout) before any rank reloads the sample.
+    assert exp.action_mask is not None and exp.rewards is not None and exp.rollout_log_probs is not None
 
     # offload() is idempotent: a second call must not re-put the now-nulled fields and clobber the
     # ref (the reload below would then restore Nones and lose the sample's tensors).
@@ -224,31 +225,23 @@ def test_rollout_reference_kl_requires_rollout_log_probs(monkeypatch):
 
 
 def test_rollout_reference_kl_reads_the_log_probs_of_an_offloaded_sample(monkeypatch):
-    """The controller receives rollout samples as the runner shipped them: lazy, their heavy tensors
-    (the rollout log-probs among them) still in the producing runner's object store. The reference has
-    to resolve from there and leave the sample lazy — reloading it would drag every sample's token ids
-    and images onto the controller."""
-    ray = pytest.importorskip("ray")
-    root = str(Path(__file__).resolve().parents[2])
-    pythonpath = os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")]))  # workers import molt
-    ray.init(
-        num_cpus=2,
-        include_dashboard=False,
-        logging_level="ERROR",
-        runtime_env={"env_vars": {"PYTHONPATH": pythonpath}},
+    """The controller sees every rollout sample as the runner shipped it: offloaded. The rollout
+    log-probs have to survive that trip, or --algo.kl.ref rollout has no reference to read and the
+    run dies on its first train step."""
+    monkeypatch.setattr(experience_mod.ray, "put", lambda obj: obj)  # a one-object store
+    rollout = torch.tensor([[-1.5, -1.0, -0.5]])
+
+    exp, _ = _make_experience_with_rollout_reference(
+        monkeypatch, use_loss=True, rollout_log_probs=rollout, offload=True
     )
-    try:
-        rollout = torch.tensor([[-1.5, -1.0, -0.5]])
+    torch.testing.assert_close(exp.base_action_log_probs, rollout)  # KL-in-loss: policy_train reads them
+    assert exp.heavy_ref is not None  # resolved from the sample as shipped, without reloading it
 
-        exp, _ = _make_experience_with_rollout_reference(
-            monkeypatch, use_loss=True, rollout_log_probs=rollout, offload=True
-        )
-        torch.testing.assert_close(exp.base_action_log_probs, rollout)  # KL-in-loss: policy_train reads them
-        assert exp.heavy_ref is not None  # still lazy: the sample's token ids and images never came over
+    exp, action = _make_experience_with_rollout_reference(
+        monkeypatch, use_loss=False, rollout_log_probs=rollout, offload=True
+    )
+    torch.testing.assert_close(exp.kl, action - rollout)  # KL-as-reward: k1 against the rollout policy
 
-        exp, action = _make_experience_with_rollout_reference(
-            monkeypatch, use_loss=False, rollout_log_probs=rollout, offload=True
-        )
-        torch.testing.assert_close(exp.kl, action - rollout)  # KL-as-reward: k1 against the rollout policy
-    finally:
-        ray.shutdown()
+    # A sample that really carries no rollout log-probs is still the configuration error it was.
+    with pytest.raises(ValueError, match="rollout log-probs"):
+        _make_experience_with_rollout_reference(monkeypatch, use_loss=True, rollout_log_probs=None, offload=True)

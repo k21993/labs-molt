@@ -39,13 +39,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-@ray.remote(num_cpus=0)
-def _offloaded_rollout_log_probs(heavy):
-    """Read one offloaded sample's rollout log-probs out of its heavy blob (Ray dereferences the
-    ``heavy_ref`` argument, so the blob is unpacked where it lives and only the log-probs travel)."""
-    return heavy["rollout_log_probs"]
-
-
 def rollout_and_group_ids(experience):
     """Per-sample rollout and prompt-group ids, with the fallbacks the pipeline shares.
 
@@ -143,17 +136,11 @@ class RemoteExperienceMaker:
             self._dispatch_forward(experiences, self.initial_model_group, "base_action_log_probs")
         elif args.algo.kl.ref == "rollout" and args.algo.kl.init_coef > 0:
             # The rollout policy is the KL reference: vLLM returned its log-probs of the sampled tokens
-            # with the samples, so no reference model exists or runs. The samples are still lazy here,
-            # and those log-probs are one of the heavy fields the runner offloaded, so fetch that one
-            # field; reload() would pull every sample's token ids and images onto the controller.
-            lazy = {i: e.heavy_ref for i, e in enumerate(experiences) if e.heavy_ref is not None}
-            refs = [_offloaded_rollout_log_probs.remote(heavy_ref) for heavy_ref in lazy.values()]
-            pulled = dict(zip(lazy, ray.get(refs))) if refs else {}
-            for i, experience in enumerate(experiences):
-                log_probs = pulled.get(i, experience.rollout_log_probs)  # local on a warm-resumed sample
-                if log_probs is None:
+            # with the samples, so no reference model exists or runs.
+            for experience in experiences:
+                if experience.rollout_log_probs is None:
                     raise ValueError("--algo.kl.ref rollout needs the rollout log-probs, but the samples carry none")
-                experience.base_action_log_probs = log_probs
+                experience.base_action_log_probs = experience.rollout_log_probs
 
         # Old actor log-probs. Force-on-policy with no KL reward (kl_coef==0): old == the training
         # forward, so the PPO ratio is 1 (REINFORCE) and policy_train recomputes old itself — skip
