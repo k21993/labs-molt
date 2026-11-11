@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -186,9 +188,10 @@ def _kl_args(ref, use_loss):
     )
 
 
-def _make_experience_with_rollout_reference(monkeypatch, use_loss, rollout_log_probs):
+def _make_experience_with_rollout_reference(monkeypatch, use_loss, rollout_log_probs, offload=False):
     """make_experience with --algo.kl.ref rollout: no reference group exists; the actor forward is
-    stubbed, and asking for a reference forward is the failure the test guards against."""
+    stubbed, and asking for a reference forward is the failure the test guards against. ``offload``
+    ships the sample the way a runner does, with its heavy tensors left in the object store."""
     maker = RemoteExperienceMaker(object(), None, None, SimpleNamespace(args=_kl_args("rollout", use_loss)), None)
     action_log_probs = torch.tensor([[-1.0, -2.0, -0.5]])
 
@@ -199,6 +202,8 @@ def _make_experience_with_rollout_reference(monkeypatch, use_loss, rollout_log_p
 
     monkeypatch.setattr(maker, "_dispatch_forward", _fake_dispatch)
     exp = Experience(action_mask=torch.ones(1, 3, dtype=torch.bool), rollout_log_probs=rollout_log_probs, info={})
+    if offload:
+        exp.offload()
     return maker.make_experience([exp])[0], action_log_probs
 
 
@@ -216,3 +221,34 @@ def test_rollout_reference_kl_uses_the_rollout_log_probs_without_a_reference_mod
 def test_rollout_reference_kl_requires_rollout_log_probs(monkeypatch):
     with pytest.raises(ValueError, match="rollout log-probs"):
         _make_experience_with_rollout_reference(monkeypatch, use_loss=True, rollout_log_probs=None)
+
+
+def test_rollout_reference_kl_reads_the_log_probs_of_an_offloaded_sample(monkeypatch):
+    """The controller receives rollout samples as the runner shipped them: lazy, their heavy tensors
+    (the rollout log-probs among them) still in the producing runner's object store. The reference has
+    to resolve from there and leave the sample lazy — reloading it would drag every sample's token ids
+    and images onto the controller."""
+    ray = pytest.importorskip("ray")
+    root = str(Path(__file__).resolve().parents[2])
+    pythonpath = os.pathsep.join(filter(None, [root, os.environ.get("PYTHONPATH")]))  # workers import molt
+    ray.init(
+        num_cpus=2,
+        include_dashboard=False,
+        logging_level="ERROR",
+        runtime_env={"env_vars": {"PYTHONPATH": pythonpath}},
+    )
+    try:
+        rollout = torch.tensor([[-1.5, -1.0, -0.5]])
+
+        exp, _ = _make_experience_with_rollout_reference(
+            monkeypatch, use_loss=True, rollout_log_probs=rollout, offload=True
+        )
+        torch.testing.assert_close(exp.base_action_log_probs, rollout)  # KL-in-loss: policy_train reads them
+        assert exp.heavy_ref is not None  # still lazy: the sample's token ids and images never came over
+
+        exp, action = _make_experience_with_rollout_reference(
+            monkeypatch, use_loss=False, rollout_log_probs=rollout, offload=True
+        )
+        torch.testing.assert_close(exp.kl, action - rollout)  # KL-as-reward: k1 against the rollout policy
+    finally:
+        ray.shutdown()
